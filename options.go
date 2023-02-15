@@ -90,3 +90,9 @@ func WithShardClosedHandler(h ShardClosedHandler) Option {
 		c.shardClosedHandler = h
 	}
 }
+
+func WithIsRetriableErrorHandler(i IsRetriableErrorFunc) Option {
+	return func(c *Consumer) {
+		c.isRetriableErrorFunc = i
+	}
+}

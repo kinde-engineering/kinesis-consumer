@@ -40,8 +40,9 @@ func New(streamName string, opts ...Option) (*Consumer, error) {
 		logger: &noopLogger{
 			logger: log.New(ioutil.Discard, "", log.LstdFlags),
 		},
-		scanInterval: 250 * time.Millisecond,
-		maxRecords:   10000,
+		scanInterval:         250 * time.Millisecond,
+		maxRecords:           10000,
+		isRetriableErrorFunc: isRetriableError,
 	}
 
 	// override defaults
@@ -66,6 +67,13 @@ func New(streamName string, opts ...Option) (*Consumer, error) {
 	return c, nil
 }
 
+// IsRetriableErrorFunc is the type of the function called
+// when GetRecords encounters an error and needs to verify
+// whether to retry the call to GetRecords or to abort.
+// It is used to override the isRetriableError function
+// that is called in the ScanShard function
+type IsRetriableErrorFunc func(error) bool
+
 // Consumer wraps the interaction with the Kinesis stream
 type Consumer struct {
 	streamName               string
@@ -80,6 +88,7 @@ type Consumer struct {
 	maxRecords               int64
 	isAggregated             bool
 	shardClosedHandler       ShardClosedHandler
+	isRetriableErrorFunc     IsRetriableErrorFunc
 }
 
 // ScanFunc is the type of the function called for each message read
@@ -171,7 +180,7 @@ func (c *Consumer) ScanShard(ctx context.Context, shardID string, fn ScanFunc) e
 		if err != nil {
 			c.logger.Log("[CONSUMER] get records error:", err.Error())
 
-			if !isRetriableError(err) {
+			if c.isRetriableErrorFunc(err) {
 				return fmt.Errorf("get records error: %v", err.Error())
 			}
 
