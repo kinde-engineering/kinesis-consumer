@@ -169,6 +169,7 @@ func (c *Consumer) ScanShard(ctx context.Context, shardID string, fn ScanFunc) e
 
 	scanTicker := time.NewTicker(c.scanInterval)
 	defer scanTicker.Stop()
+	backoffInterval := c.scanInterval / time.Duration(10)
 
 	for {
 		resp, err := c.client.GetRecords(ctx, &kinesis.GetRecordsInput{
@@ -180,9 +181,12 @@ func (c *Consumer) ScanShard(ctx context.Context, shardID string, fn ScanFunc) e
 		if err != nil {
 			c.logger.Log("[CONSUMER] get records error:", err.Error())
 
-			if c.isRetriableErrorFunc(err) {
+			if !c.isRetriableErrorFunc(err) {
 				return fmt.Errorf("get records error: %v", err.Error())
 			}
+
+			time.Sleep(backoffInterval)
+			backoffInterval = backoffInterval + (backoffInterval / time.Duration(10))
 
 			shardIterator, err = c.getShardIterator(ctx, c.streamName, shardID, lastSeqNum)
 			if err != nil {
@@ -237,6 +241,7 @@ func (c *Consumer) ScanShard(ctx context.Context, shardID string, fn ScanFunc) e
 			}
 
 			shardIterator = resp.NextShardIterator
+			backoffInterval = c.scanInterval / time.Duration(10)
 		}
 
 		// Wait for next scan
