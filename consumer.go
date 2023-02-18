@@ -13,7 +13,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/kinesis"
 	"github.com/aws/aws-sdk-go-v2/service/kinesis/types"
-	"github.com/harlow/kinesis-consumer/internal/deaggregator"
+	"github.com/kinde-engineering/kinesis-consumer/internal/deaggregator"
 )
 
 // Record wraps the record returned from the Kinesis library and
@@ -40,8 +40,9 @@ func New(streamName string, opts ...Option) (*Consumer, error) {
 		logger: &noopLogger{
 			logger: log.New(ioutil.Discard, "", log.LstdFlags),
 		},
-		scanInterval: 250 * time.Millisecond,
-		maxRecords:   10000,
+		scanInterval:         250 * time.Millisecond,
+		maxRecords:           10000,
+		isRetriableErrorFunc: isRetriableError,
 	}
 
 	// override defaults
@@ -66,6 +67,13 @@ func New(streamName string, opts ...Option) (*Consumer, error) {
 	return c, nil
 }
 
+// IsRetriableErrorFunc is the type of the function called
+// when GetRecords encounters an error and needs to verify
+// whether to retry the call to GetRecords or to abort.
+// It is used to override the isRetriableError function
+// that is called in the ScanShard function
+type IsRetriableErrorFunc func(error) bool
+
 // Consumer wraps the interaction with the Kinesis stream
 type Consumer struct {
 	streamName               string
@@ -80,6 +88,7 @@ type Consumer struct {
 	maxRecords               int64
 	isAggregated             bool
 	shardClosedHandler       ShardClosedHandler
+	isRetriableErrorFunc     IsRetriableErrorFunc
 }
 
 // ScanFunc is the type of the function called for each message read
@@ -160,6 +169,7 @@ func (c *Consumer) ScanShard(ctx context.Context, shardID string, fn ScanFunc) e
 
 	scanTicker := time.NewTicker(c.scanInterval)
 	defer scanTicker.Stop()
+	backoffInterval := c.scanInterval / time.Duration(10)
 
 	for {
 		resp, err := c.client.GetRecords(ctx, &kinesis.GetRecordsInput{
@@ -171,9 +181,12 @@ func (c *Consumer) ScanShard(ctx context.Context, shardID string, fn ScanFunc) e
 		if err != nil {
 			c.logger.Log("[CONSUMER] get records error:", err.Error())
 
-			if !isRetriableError(err) {
+			if !c.isRetriableErrorFunc(err) {
 				return fmt.Errorf("get records error: %v", err.Error())
 			}
+
+			time.Sleep(backoffInterval)
+			backoffInterval = backoffInterval + (backoffInterval / time.Duration(10))
 
 			shardIterator, err = c.getShardIterator(ctx, c.streamName, shardID, lastSeqNum)
 			if err != nil {
@@ -228,6 +241,7 @@ func (c *Consumer) ScanShard(ctx context.Context, shardID string, fn ScanFunc) e
 			}
 
 			shardIterator = resp.NextShardIterator
+			backoffInterval = c.scanInterval / time.Duration(10)
 		}
 
 		// Wait for next scan
