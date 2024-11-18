@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"sync"
 	"time"
@@ -38,7 +38,7 @@ func New(streamName string, opts ...Option) (*Consumer, error) {
 		store:                    &noopStore{},
 		counter:                  &noopCounter{},
 		logger: &noopLogger{
-			logger: log.New(ioutil.Discard, "", log.LstdFlags),
+			logger: log.New(io.Discard, "", log.LstdFlags),
 		},
 		scanInterval:         250 * time.Millisecond,
 		maxRecords:           10000,
@@ -99,7 +99,7 @@ type Consumer struct {
 type ScanFunc func(*Record) error
 
 // ErrSkipCheckpoint is used as a return value from ScanFunc to indicate that
-// the current checkpoint should be skipped skipped. It is not returned
+// the current checkpoint should be skipped. It is not returned
 // as an error by any function.
 var ErrSkipCheckpoint = errors.New("skip checkpoint")
 
@@ -111,40 +111,60 @@ func (c *Consumer) Scan(ctx context.Context, fn ScanFunc) error {
 	defer cancel()
 
 	var (
-		errc   = make(chan error, 1)
-		shardc = make(chan types.Shard, 1)
+		errC   = make(chan error, 1)
+		shardC = make(chan types.Shard, 1)
 	)
 
 	go func() {
-		c.group.Start(ctx, shardc)
+		err := c.group.Start(ctx, shardC)
+		if err != nil {
+			errC <- fmt.Errorf("error starting scan: %w", err)
+			cancel()
+		}
 		<-ctx.Done()
-		close(shardc)
+		close(shardC)
 	}()
 
 	wg := new(sync.WaitGroup)
 	// process each of the shards
-	for shard := range shardc {
+	s := newShardsInProcess()
+	for shard := range shardC {
+		shardId := aws.ToString(shard.ShardId)
+		if s.doesShardExist(shardId) {
+			// safetynet: if shard already in process by another goroutine, just skipping the request
+			continue
+		}
 		wg.Add(1)
 		go func(shardID string) {
+			s.addShard(shardID)
+			defer func() {
+				s.deleteShard(shardID)
+			}()
 			defer wg.Done()
-			if err := c.ScanShard(ctx, shardID, fn); err != nil {
+			var err error
+			if err = c.ScanShard(ctx, shardID, fn); err != nil {
+				err = fmt.Errorf("shard %s error: %w", shardID, err)
+			} else if closeable, ok := c.group.(CloseableGroup); !ok {
+				// group doesn't allow closure, skip calling CloseShard
+			} else if err = closeable.CloseShard(ctx, shardID); err != nil {
+				err = fmt.Errorf("shard closed CloseableGroup error: %w", err)
+			}
+			if err != nil {
 				select {
-				case errc <- fmt.Errorf("shard %s error: %w", shardID, err):
-					// first error to occur
+				case errC <- fmt.Errorf("shard %s error: %w", shardID, err):
 					cancel()
 				default:
-					// error has already occurred
 				}
 			}
-		}(aws.ToString(shard.ShardId))
+		}(shardId)
 	}
 
 	go func() {
 		wg.Wait()
-		close(errc)
+		close(errC)
 	}()
 
-	return <-errc
+	return <-errC
 }
 
 // ScanShard loops over records on a specific shard, calls the callback func
@@ -212,14 +232,12 @@ func (c *Consumer) ScanShard(ctx context.Context, shardID string, fn ScanFunc) e
 					return nil
 				default:
 					err := fn(&Record{r, shardID, resp.MillisBehindLatest})
-					if err != nil && err != ErrSkipCheckpoint {
+					if err != nil && !errors.Is(err, ErrSkipCheckpoint) {
 						return err
 					}
 
-					if err != ErrSkipCheckpoint {
-						if err := c.group.SetCheckpoint(c.streamName, shardID, *r.SequenceNumber); err != nil {
-							return err
-						}
+					if err := c.group.SetCheckpoint(c.streamName, shardID, *r.SequenceNumber); err != nil {
+						return err
 					}
 
 					c.counter.Add("records", 1)
@@ -231,9 +249,7 @@ func (c *Consumer) ScanShard(ctx context.Context, shardID string, fn ScanFunc) e
 				c.logger.Log("[CONSUMER] shard closed:", shardID)
 
 				if c.shardClosedHandler != nil {
-					err := c.shardClosedHandler(c.streamName, shardID)
-
-					if err != nil {
+					if err := c.shardClosedHandler(c.streamName, shardID); err != nil {
 						return fmt.Errorf("shard closed handler error: %w", err)
 					}
 				}
@@ -286,18 +302,21 @@ func (c *Consumer) getShardIterator(ctx context.Context, streamName, shardID, se
 		params.ShardIteratorType = types.ShardIteratorTypeAtTimestamp
 		params.Timestamp = c.initialTimestamp
 	} else {
-		params.ShardIteratorType = types.ShardIteratorType(c.initialShardIteratorType)
+		params.ShardIteratorType = c.initialShardIteratorType
 	}
 
 	res, err := c.client.GetShardIterator(ctx, params)
-	return res.ShardIterator, err
+	if err != nil {
+		return nil, err
+	}
+	return res.ShardIterator, nil
 }
 
 func isRetriableError(err error) bool {
-	switch err.(type) {
-	case *types.ExpiredIteratorException:
+	if oe := (*types.ExpiredIteratorException)(nil); errors.As(err, &oe) {
 		return true
-	case *types.ProvisionedThroughputExceededException:
+	}
+	if oe := (*types.ProvisionedThroughputExceededException)(nil); errors.As(err, &oe) {
 		return true
 	}
 	return false
@@ -305,4 +324,35 @@ func isRetriableError(err error) bool {
 
 func isShardClosed(nextShardIterator, currentShardIterator *string) bool {
 	return nextShardIterator == nil || currentShardIterator == nextShardIterator
+}
+
+type shards struct {
+	*sync.RWMutex
+	shardsInProcess map[string]struct{}
+}
+
+func newShardsInProcess() *shards {
+	return &shards{
+		RWMutex:         &sync.RWMutex{},
+		shardsInProcess: make(map[string]struct{}),
+	}
+}
+
+func (s *shards) addShard(shardId string) {
+	s.Lock()
+	defer s.Unlock()
+	s.shardsInProcess[shardId] = struct{}{}
+}
+
+func (s *shards) doesShardExist(shardId string) bool {
+	s.RLock()
+	defer s.RUnlock()
+	_, ok := s.shardsInProcess[shardId]
+	return ok
+}
+
+func (s *shards) deleteShard(shardId string) {
+	s.Lock()
+	defer s.Unlock()
+	delete(s.shardsInProcess, shardId)
 }
