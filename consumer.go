@@ -114,12 +114,21 @@ func (c *Consumer) Scan(ctx context.Context, fn ScanFunc) error {
 		errC   = make(chan error, 1)
 		shardC = make(chan types.Shard, 1)
 	)
+	// Keep the first error and always cancel. The send must not block: errC
+	// holds one error, and a blocked sender here would never close shardC, so
+	// Scan would never return.
+	reportError := func(err error) {
+		select {
+		case errC <- err:
+		default:
+		}
+		cancel()
+	}
 
 	go func() {
 		err := c.group.Start(ctx, shardC)
 		if err != nil {
-			errC <- fmt.Errorf("error starting scan: %w", err)
-			cancel()
+			reportError(fmt.Errorf("error starting scan: %w", err))
 		}
 		<-ctx.Done()
 		close(shardC)
@@ -150,11 +159,7 @@ func (c *Consumer) Scan(ctx context.Context, fn ScanFunc) error {
 				err = fmt.Errorf("shard closed CloseableGroup error: %w", err)
 			}
 			if err != nil {
-				select {
-				case errC <- fmt.Errorf("shard %s error: %w", shardID, err):
-					cancel()
-				default:
-				}
+				reportError(fmt.Errorf("shard %s error: %w", shardID, err))
 			}
 		}(shardId)
 	}
