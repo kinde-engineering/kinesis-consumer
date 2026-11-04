@@ -176,6 +176,61 @@ func TestScan_GetShardIteratorError(t *testing.T) {
 	}
 }
 
+// A shard fails while the group's shard listing is still running. The listing
+// then fails too. Scan must return the first error and not hang. Adapted from
+// harlow/kinesis-consumer#203.
+func TestScan_ConcurrentShardAndGroupErrorsDoNotDeadlock(t *testing.T) {
+	shardErr := errors.New("mock get shard iterator error")
+	groupErr := errors.New("mock group error")
+	client := &kinesisClientMock{
+		getShardIteratorMock: func(ctx context.Context, params *kinesis.GetShardIteratorInput, optFns ...func(*kinesis.Options)) (*kinesis.GetShardIteratorOutput, error) {
+			return nil, shardErr
+		},
+	}
+
+	c, err := New("myStreamName",
+		WithClient(client),
+		WithGroup(&concurrentFailureGroup{err: groupErr}),
+	)
+	if err != nil {
+		t.Fatalf("new consumer error: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- c.Scan(context.Background(), func(r *Record) error { return nil })
+	}()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, shardErr) {
+			t.Fatalf("scan error = %v, want first shard error %v", err, shardErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Scan deadlocked after concurrent shard and group errors")
+	}
+}
+
+// concurrentFailureGroup sends one shard, then fails once the scan context is
+// cancelled, like a shard listing that is in progress when a shard fails.
+type concurrentFailureGroup struct {
+	err error
+}
+
+func (g *concurrentFailureGroup) Start(ctx context.Context, shardC chan types.Shard) error {
+	shardC <- types.Shard{ShardId: aws.String("myShard")}
+	<-ctx.Done()
+	return g.err
+}
+
+func (g *concurrentFailureGroup) GetCheckpoint(streamName, shardID string) (string, error) {
+	return "", nil
+}
+
+func (g *concurrentFailureGroup) SetCheckpoint(streamName, shardID, sequenceNumber string) error {
+	return nil
+}
+
 func TestScanShard(t *testing.T) {
 	var client = &kinesisClientMock{
 		getShardIteratorMock: func(ctx context.Context, params *kinesis.GetShardIteratorInput, optFns ...func(*kinesis.Options)) (*kinesis.GetShardIteratorOutput, error) {
